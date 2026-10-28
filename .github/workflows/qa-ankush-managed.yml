@@ -1,0 +1,90 @@
+{
+  "name": "qa-ankush-managed",
+  "run-name": "${{ inputs.helio_execution_id }}",
+  "on": {
+    "workflow_dispatch": {
+      "inputs": {
+        "helio_execution_id": {
+          "type": "string",
+          "required": false,
+          "default": ""
+        },
+        "helio_release_id": {
+          "type": "string",
+          "required": false,
+          "default": ""
+        },
+        "workflow_revision": {
+          "type": "string",
+          "required": false,
+          "default": ""
+        },
+        "release_version": {
+          "type": "string",
+          "required": false,
+          "default": ""
+        },
+        "environment": {
+          "type": "string",
+          "default": "qa-ankush-managed-production"
+        },
+        "helio_stage_id": {
+          "type": "string",
+          "required": false,
+          "default": ""
+        }
+      }
+    }
+  },
+  "permissions": {
+    "contents": "read",
+    "deployments": "write"
+  },
+  "concurrency": {
+    "group": "qa-ankush-managed-release",
+    "cancel-in-progress": false
+  },
+  "jobs": {
+    "test": {
+      "runs-on": "ubuntu-24.04",
+      "timeout-minutes": 10,
+      "environment": "qa-ankush-managed-test",
+      "steps": [
+        {
+          "name": "Synthetic runner work",
+          "shell": "bash",
+          "run": "sleep 30"
+        }
+      ],
+      "if": "${{ always() && inputs.helio_stage_id == 'test' }}"
+    },
+    "production": {
+      "needs": "test",
+      "runs-on": "ubuntu-24.04",
+      "timeout-minutes": 10,
+      "environment": "qa-ankush-managed-production",
+      "steps": [
+        {
+          "name": "Synthetic runner work",
+          "shell": "bash",
+          "run": "sleep 30"
+        },
+        {
+          "name": "Record synthetic deployment evidence",
+          "shell": "bash",
+          "env": {
+            "GH_TOKEN": "${{ github.token }}",
+            "APP_SLUG": "qa-ankush-managed",
+            "TARGET_ENVIRONMENT": "qa-ankush-managed-production",
+            "HELIO_EXECUTION_ID": "${{ inputs.helio_execution_id }}",
+            "HELIO_RELEASE_ID": "${{ inputs.helio_release_id }}",
+            "WORKFLOW_REVISION": "${{ inputs.workflow_revision }}",
+            "RELEASE_VERSION": "${{ inputs.release_version }}"
+          },
+          "run": "set -euo pipefail\npython3 - <<'PY'\nimport hashlib, json, os, pathlib, re, uuid\nuuid.UUID(os.environ[\"HELIO_RELEASE_ID\"])\nassert re.fullmatch(r\"[A-Za-z0-9._:-]{1,200}\", os.environ[\"HELIO_EXECUTION_ID\"])\nassert os.environ[\"WORKFLOW_REVISION\"] == os.environ[\"GITHUB_SHA\"]\nartifact = pathlib.Path(\"synthetic-artifact.json\")\nartifact.write_text(json.dumps({\"application\": os.environ[\"APP_SLUG\"], \"version\": os.environ[\"RELEASE_VERSION\"], \"commit\": os.environ[\"GITHUB_SHA\"]}, sort_keys=True))\ndigest = \"sha256:\" + hashlib.sha256(artifact.read_bytes()).hexdigest()\ndeployed = pathlib.Path(\"synthetic-deployed.json\")\ndeployed.write_bytes(artifact.read_bytes())\nassert \"sha256:\" + hashlib.sha256(deployed.read_bytes()).hexdigest() == digest\npayload = {\"schema_version\": 1, \"helio_execution_id\": os.environ[\"HELIO_EXECUTION_ID\"], \"release_id\": os.environ[\"HELIO_RELEASE_ID\"], \"artifact_digest\": digest, \"artifact_uri\": \"urn:helio-capacity:\" + os.environ[\"APP_SLUG\"] + \"@\" + digest, \"rollback_workflow_id\": \".github/workflows/\" + os.environ[\"APP_SLUG\"] + \".yml\", \"workflow_revision\": os.environ[\"WORKFLOW_REVISION\"]}\npathlib.Path(\"deployment-evidence.json\").write_text(json.dumps({\"ref\": os.environ[\"GITHUB_SHA\"], \"auto_merge\": False, \"required_contexts\": [], \"environment\": os.environ[\"TARGET_ENVIRONMENT\"], \"task\": \"helio-forward-release\", \"payload\": payload}))\nPY\npython3 - <<'PY'\nimport json, os, subprocess, time\nrepo, env, sha = os.environ[\"GITHUB_REPOSITORY\"], os.environ[\"TARGET_ENVIRONMENT\"], os.environ[\"GITHUB_SHA\"]\nexecution = os.environ[\"HELIO_EXECUTION_ID\"]\ndef gh(*args):\n    r = subprocess.run([\"gh\", \"api\", *args], capture_output=True, text=True)\n    if r.returncode != 0:\n        raise RuntimeError((r.stderr or r.stdout).strip()[:300] or \"gh exit \" + str(r.returncode))\n    return json.loads(r.stdout) if r.stdout.strip() else None\ndef existing_deployment():\n    for d in gh(f\"repos/{repo}/deployments?environment={env}&sha={sha}&per_page=100\") or []:\n        if (d.get(\"payload\") or {}).get(\"helio_execution_id\") == execution:\n            return d[\"id\"]\ndef has_success(deployment):\n    return any(s.get(\"state\") == \"success\" for s in gh(f\"repos/{repo}/deployments/{deployment}/statuses?per_page=100\") or [])\ndef retried(label, step, attempts=6):\n    for attempt in range(1, attempts + 1):\n        try:\n            value = step()\n            if value:\n                return value\n            print(f\"{label}: attempt {attempt} returned nothing usable\")\n        except Exception as error:\n            print(f\"{label}: attempt {attempt} failed: {error}\")\n        if attempt < attempts:\n            time.sleep(min(2 ** attempt, 30))\n    raise SystemExit(f\"{label}: no result after {attempts} attempts\")\ndef create():\n    found = existing_deployment()\n    if found:\n        return found\n    created = gh(\"--method\", \"POST\", f\"repos/{repo}/deployments\", \"--input\", \"deployment-evidence.json\")\n    return (created or {}).get(\"id\")\ndeployment = retried(\"create deployment\", create)\ndef succeed():\n    if not has_success(deployment):\n        gh(\"--method\", \"POST\", f\"repos/{repo}/deployments/{deployment}/statuses\", \"-f\", \"state=success\",\n           \"-f\", \"description=Synthetic capacity artifact copied and digest verified; no application deployment\")\n    return has_success(deployment)\nretried(\"record success\", succeed)\nprint(f\"deployment {deployment} recorded with a success status\")\nPY"
+        }
+      ],
+      "if": "${{ always() && inputs.helio_stage_id == 'production' }}"
+    }
+  }
+}
